@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ddimg - interactive ddrescue wrapper
+# - Prompts for source/dest drive letters (e.g., "a", "b")
+# - NEW: Source target selection: whole disk OR specific partition
+# - Assumes /dev/sdX (source disk) and /dev/sdY1 (dest partition)
+# - Ensures destination mountpoint is clean:
+#     * If /mnt/backupdrive is already mounted, offers to unmount it
+#     * If destination partition is mounted elsewhere, offers to unmount it
+# - Recovery directory options:
+#     1) Default: recovery (auto-increment if exists)
+#     2) Timestamped: recovery-YYYY-MM-DD_HH-MM (auto-increment if exists)
+#     3) Custom name: you type it (auto-increment if exists)
+#     4) Re-attempt / Resume: select an existing folder (NO auto-increment) OR type a folder path/name
+# - NEW: Destination free-space check vs source target size (best-effort)
+# - Imaging profiles:
+#     1) Normal
+#     2) Dying-Triage
+#     3) Aggressive
+#     4) SeverelyFailing-HangProne (skip slow zones + timeout escape)
+# - Creates recovery dir, writes image + mapfile + notes
+
+require_cmds=(lsblk mount umount ddrescue mountpoint findmnt date find sort awk sed df blockdev)
+for c in "${require_cmds[@]}"; do
+  command -v "$c" >/dev/null 2>&1 || { echo "Missing required command: $c"; exit 1; }
+done
+
+echo "=== ddimg: ddrescue imaging helper ==="
+echo "Drives detected:"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+
+echo
+read -rp "Enter SOURCE drive letter (failing disk), e.g., 'a' for /dev/sda: " SRC_LET
+read -rp "Enter DESTINATION drive letter (where the .img will be stored), e.g., 'b' for /dev/sdb1: " DST_LET
+
+SRC_DISK="/dev/sd${SRC_LET}"
+DST_PART="/dev/sd${DST_LET}1"   # assume partition 1 for destination
+
+# Validate devices
+if [[ ! -b "$SRC_DISK" ]]; then
+  echo "ERROR: Source disk $SRC_DISK not found."
+  exit 1
+fi
+if [[ ! -b "$DST_PART" ]]; then
+  echo "ERROR: Destination partition $DST_PART not found."
+  exit 1
+fi
+
+# Safety check: prevent same drive for src/dst (disk-level)
+if [[ "$SRC_DISK" == "/dev/sd${DST_LET}" ]]; then
+  echo "ERROR: Source and destination must be different drives."
+  exit 1
+fi
+
+# -----------------------------
+# NEW: Choose source target (disk vs partition)
+# -----------------------------
+echo
+echo "Source target options for $SRC_DISK:"
+echo "  1) Whole disk (recommended if you have space): $SRC_DISK"
+echo "  2) Specific partition on $SRC_DISK (saves space)"
+echo
+read -rp "Choose source target [1/2] (default: 1): " SRC_MODE
+SRC_MODE="${SRC_MODE:-1}"
+
+SRC_DEV="$SRC_DISK"
+SRC_DESC="Whole disk"
+
+if [[ "$SRC_MODE" == "2" ]]; then
+  echo
+  echo "Partitions detected on $SRC_DISK:"
+  # Show partitions only (TYPE=part) for this disk.
+  # NAME column will be like sdb1, sdb2...
+  lsblk -nr -o NAME,SIZE,FSTYPE,TYPE,MOUNTPOINT "$SRC_DISK" | awk '$4=="part"{printf "  %s  %s  %s  %s\n",$1,$2,($3==""?"-":$3),($5==""?"-":$5)}'
+
+  # Build an array of partition device paths
+  mapfile -t PART_NAMES < <(lsblk -nr -o NAME,TYPE "$SRC_DISK" | awk '$2=="part"{print $1}')
+  if [[ ${#PART_NAMES[@]} -eq 0 ]]; then
+    echo "ERROR: No partitions found on $SRC_DISK."
+    echo "Tip: choose Whole disk instead, or verify the disk is presenting a partition table."
+    exit 1
+  fi
+
+  echo
+  echo "Select a partition to image:"
+  for i in "${!PART_NAMES[@]}"; do
+    p="${PART_NAMES[$i]}"
+    # Grab details for display
+    line="$(lsblk -nr -o NAME,SIZE,FSTYPE,MOUNTPOINT "/dev/$p" | head -n 1)"
+    # line: name size fstype mountpoint
+    name="$(awk '{print $1}' <<<"$line")"
+    size="$(awk '{print $2}' <<<"$line")"
+    fstype="$(awk '{print $3}' <<<"$line")"
+    mntp="$(awk '{print $4}' <<<"$line")"
+    [[ -z "${fstype:-}" ]] && fstype="-"
+    [[ -z "${mntp:-}" ]] && mntp="-"
+    printf "  %2d) /dev/%s  size=%s  fstype=%s  mnt=%s\n" "$((i+1))" "$name" "$size" "$fstype" "$mntp"
+  done
+
+  echo
+  read -rp "Enter partition number (1-${#PART_NAMES[@]}): " PSEL
+  if [[ ! "$PSEL" =~ ^[0-9]+$ ]] || (( PSEL < 1 || PSEL > ${#PART_NAMES[@]} )); then
+    echo "ERROR: Invalid partition selection."
+    exit 1
+  fi
+
+  SRC_DEV="/dev/${PART_NAMES[$((PSEL-1))]}"
+  SRC_DESC="Partition"
+fi
+
+# Confirm intent
+echo
+echo "About to image:"
+echo "  SOURCE ($SRC_DESC) = $SRC_DEV"
+echo "  DEST partition     = $DST_PART (will mount and write image + mapfile into your chosen recovery folder)"
+read -rp "Proceed? (yes/NO): " OK
+[[ "${OK,,}" == "yes" ]] || { echo "Aborted."; exit 1; }
+
+# Prepare mount point
+MNT="/mnt/backupdrive"
+sudo mkdir -p "$MNT"
+
+# Ensure mountpoint is clean
+if mountpoint -q "$MNT"; then
+  CUR_SRC="$(findmnt -n -o SOURCE --target "$MNT" 2>/dev/null || true)"
+  echo
+  echo "NOTE: $MNT is already mounted."
+  echo "Mounted source: ${CUR_SRC:-unknown}"
+  read -rp "Unmount $MNT now so we can mount $DST_PART cleanly? (YES to unmount, anything else to keep): " UM_MNT
+  if [[ "${UM_MNT,,}" == "yes" ]]; then
+    sudo umount "$MNT"
+    echo "Unmounted $MNT"
+  else
+    echo "Keeping existing mount at $MNT. (This can cause problems if it's not the correct destination.)"
+  fi
+fi
+
+# If destination partition is mounted somewhere, offer to unmount it
+CURRENT_MNT=$(lsblk -no MOUNTPOINT "$DST_PART" 2>/dev/null || true)
+if [[ -n "$CURRENT_MNT" ]]; then
+  echo
+  echo "Destination partition is currently mounted at: $CURRENT_MNT"
+  read -rp "Unmount $DST_PART now? (YES to unmount, anything else to skip): " UM
+  if [[ "${UM,,}" == "yes" ]]; then
+    sudo umount "$DST_PART"
+    echo "Unmounted $DST_PART"
+  else
+    echo "Skipping unmount step."
+  fi
+fi
+
+# Mount destination (only if not mounted at MNT)
+if ! mountpoint -q "$MNT"; then
+  sudo mount "$DST_PART" "$MNT"
+  echo "Mounted $DST_PART at $MNT"
+else
+  # Verify that the mount at MNT is actually DST_PART
+  MNT_SRC="$(findmnt -n -o SOURCE --target "$MNT" 2>/dev/null || true)"
+  if [[ "$MNT_SRC" != "$DST_PART" ]]; then
+    echo
+    echo "ERROR: $MNT is mounted, but not to $DST_PART."
+    echo "  $MNT -> $MNT_SRC"
+    echo "Expected:"
+    echo "  $MNT -> $DST_PART"
+    echo
+    echo "Fix: unmount $MNT (or rerun and choose YES when prompted), then try again."
+    exit 1
+  fi
+  echo "Destination already mounted correctly: $DST_PART at $MNT"
+fi
+
+# Helper: resolve a user-entered path. If absolute, use as-is. If relative, treat as under $MNT.
+resolve_rec_dir() {
+  local input="$1"
+  if [[ "$input" == /* ]]; then
+    echo "$input"
+  else
+    echo "$MNT/$input"
+  fi
+}
+
+# Helper: list candidate recovery folders under $MNT (contains recovery.map or recovery.log or image.img)
+list_recovery_folders() {
+  find "$MNT" -mindepth 1 -maxdepth 2 -type f \( -name "recovery.map" -o -name "recovery.log" -o -name "image.img" \) \
+    -printf '%h\n' 2>/dev/null | sort -u
+}
+
+# -----------------------------
+# Recovery directory selection
+# -----------------------------
+echo
+echo "Recovery folder options:"
+echo "  1) Default: recovery (auto-increment if it exists: recovery-1, recovery-2, ...)"
+echo "  2) Timestamped: recovery-YYYY-MM-DD_HH-MM (auto-increment if it exists)"
+echo "  3) Custom name: you type it (auto-increment if it already exists)"
+echo "  4) Re-attempt / Resume existing folder (NO auto-increment; reuses existing image/map)"
+echo
+read -rp "Choose option [1/2/3/4] (default: 1): " REC_OPT
+REC_OPT="${REC_OPT:-1}"
+
+REC_DIR=""
+BASE_NAME="recovery"
+
+case "$REC_OPT" in
+  1)
+    BASE_NAME="recovery"
+    REC_DIR="$MNT/$BASE_NAME"
+    if [[ -e "$REC_DIR" ]]; then
+      i=1
+      while [[ -e "$MNT/${BASE_NAME}-${i}" ]]; do
+        ((i++))
+      done
+      REC_DIR="$MNT/${BASE_NAME}-${i}"
+    fi
+    ;;
+  2)
+    BASE_NAME="recovery-$(date +%F_%H-%M)"
+    REC_DIR="$MNT/$BASE_NAME"
+    if [[ -e "$REC_DIR" ]]; then
+      i=1
+      while [[ -e "$MNT/${BASE_NAME}-${i}" ]]; do
+        ((i++))
+      done
+      REC_DIR="$MNT/${BASE_NAME}-${i}"
+    fi
+    ;;
+  3)
+    read -rp "Enter custom recovery folder name (e.g., recovery-1, case123, driveA): " BASE_NAME
+    BASE_NAME="${BASE_NAME:-recovery}"
+    REC_DIR="$MNT/$BASE_NAME"
+    if [[ -e "$REC_DIR" ]]; then
+      i=1
+      while [[ -e "$MNT/${BASE_NAME}-${i}" ]]; do
+        ((i++))
+      done
+      REC_DIR="$MNT/${BASE_NAME}-${i}"
+    fi
+    ;;
+  4)
+    echo
+    echo "Re-attempt / Resume mode:"
+    echo "  A) Select from detected recovery folders on $MNT"
+    echo "  B) Type a folder path/name manually"
+    echo
+    read -rp "Choose [A/B] (default: A): " RES_MODE
+    RES_MODE="${RES_MODE:-A}"
+
+    if [[ "${RES_MODE,,}" == "a" ]]; then
+      echo
+      echo "Scanning for existing recovery folders (looking for image.img / recovery.map / recovery.log)..."
+      mapfile -t CANDIDATES < <(list_recovery_folders)
+
+      if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+        echo "No existing recovery folders detected under $MNT."
+        echo "Falling back to manual entry."
+        RES_MODE="B"
+      else
+        echo
+        echo "Select a folder to resume:"
+        for i in "${!CANDIDATES[@]}"; do
+          rel="${CANDIDATES[$i]#"$MNT"/}"
+          [[ "$rel" == "${CANDIDATES[$i]}" ]] && rel="${CANDIDATES[$i]}"
+          printf "  %2d) %s\n" "$((i+1))" "$rel"
+        done
+        echo
+        read -rp "Enter number (1-${#CANDIDATES[@]}), or 'm' for manual: " PICK
+        if [[ "${PICK,,}" == "m" ]]; then
+          RES_MODE="B"
+        else
+          if [[ "$PICK" =~ ^[0-9]+$ ]] && (( PICK >= 1 && PICK <= ${#CANDIDATES[@]} )); then
+            REC_DIR="${CANDIDATES[$((PICK-1))]}"
+          else
+            echo "Invalid selection. Switching to manual entry."
+            RES_MODE="B"
+          fi
+        fi
+      fi
+    fi
+
+    if [[ "${RES_MODE,,}" == "b" ]]; then
+      echo
+      echo "Manual resume entry:"
+      echo " - Enter an existing folder path (absolute) OR a folder name under $MNT"
+      echo "   Examples:"
+      echo "     recovery-3"
+      echo "     /mnt/backupdrive/recovery-3"
+      echo
+      read -rp "Enter existing recovery folder to resume: " RESUME_INPUT
+      if [[ -z "${RESUME_INPUT:-}" ]]; then
+        echo "ERROR: You must enter a folder path/name to resume."
+        exit 1
+      fi
+      REC_DIR="$(resolve_rec_dir "$RESUME_INPUT")"
+    fi
+
+    if [[ -z "${REC_DIR:-}" ]]; then
+      echo "ERROR: Could not determine a resume folder."
+      exit 1
+    fi
+    if [[ ! -d "$REC_DIR" ]]; then
+      echo "ERROR: Resume folder does not exist: $REC_DIR"
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Invalid option. Using default: recovery (auto-increment)."
+    BASE_NAME="recovery"
+    REC_DIR="$MNT/$BASE_NAME"
+    if [[ -e "$REC_DIR" ]]; then
+      i=1
+      while [[ -e "$MNT/${BASE_NAME}-${i}" ]]; do
+        ((i++))
+      done
+      REC_DIR="$MNT/${BASE_NAME}-${i}"
+    fi
+    ;;
+esac
+
+# Create recovery directory (in resume mode it already exists; mkdir -p is safe)
+sudo mkdir -p "$REC_DIR"
+sudo chown "$(id -u)":"$(id -g)" "$REC_DIR" || true
+
+IMG="$REC_DIR/image.img"
+MAP="$REC_DIR/recovery.map"
+NOTES="$REC_DIR/notes.txt"
+
+# Resume-mode sanity checks
+if [[ "$REC_OPT" == "4" ]]; then
+  echo
+  echo "Resume selected. Using existing folder:"
+  echo "  $REC_DIR"
+  if [[ ! -f "$MAP" ]]; then
+    echo "WARNING: Mapfile not found at:"
+    echo "  $MAP"
+    echo "Resuming works best with an existing mapfile. If you proceed, ddrescue will start a new map."
+  fi
+  if [[ ! -f "$IMG" ]]; then
+    echo "WARNING: Image file not found at:"
+    echo "  $IMG"
+    echo "If you proceed, ddrescue will create a new image file in this folder."
+  fi
+  read -rp "Proceed using this folder and these file paths? (yes/NO): " RES_OK
+  [[ "${RES_OK,,}" == "yes" ]] || { echo "Aborted."; exit 1; }
+fi
+
+# -----------------------------
+# Imaging Profile selection
+# -----------------------------
+echo
+echo "Imaging profiles:"
+echo "  1) Normal (balanced):"
+echo "       PASS 1: ddrescue -n"
+echo "       PASS 2: ddrescue -r3"
+echo "       PASS 3: optional ddrescue -d -r3"
+echo
+echo "  2) Dying disk / TRIAGE (avoid week-long retries):"
+echo "       PASS 1: ddrescue -n -b 1M"
+echo "       PASS 2: ddrescue -n -R -b 1M"
+echo "       (Stops by default)"
+echo
+echo "  3) Aggressive (more retries; only if drive is stable):"
+echo "       PASS 1: ddrescue -n"
+echo "       PASS 2: ddrescue -r7"
+echo "       PASS 3: ddrescue -d -r7"
+echo
+echo "  4) Severely failing / HANG-PRONE (skip slow zones + timeout escape):"
+echo "       PASS 1: ddrescue -n --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8"
+echo "       PASS 2: ddrescue -n -R --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8"
+echo "       (Stops by default)"
+echo
+read -rp "Choose profile [1/2/3/4] (default: 1): " PROFILE
+PROFILE="${PROFILE:-1}"
+
+PROFILE_NAME="Normal"
+PASS1_ARGS=()
+PASS2_ARGS=()
+PASS3_ARGS=()
+RUN_PASS2_DEFAULT_PROMPT="yes"
+RUN_PASS3_DEFAULT_PROMPT="no"
+
+case "$PROFILE" in
+  1)
+    PROFILE_NAME="Normal"
+    PASS1_ARGS=(-n)
+    PASS2_ARGS=(-r3)
+    PASS3_ARGS=(-d -r3)
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+  2)
+    PROFILE_NAME="Dying-Triage"
+    PASS1_ARGS=(-n -b 1M)
+    PASS2_ARGS=(-n -R -b 1M)
+    PASS3_ARGS=()
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+  3)
+    PROFILE_NAME="Aggressive"
+    PASS1_ARGS=(-n)
+    PASS2_ARGS=(-r7)
+    PASS3_ARGS=(-d -r7)
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+  4)
+    PROFILE_NAME="SeverelyFailing-HangProne"
+    PASS1_ARGS=(-n --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
+    PASS2_ARGS=(-n -R --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
+    PASS3_ARGS=()
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+  *)
+    echo "Invalid profile selection. Using Normal."
+    PROFILE_NAME="Normal"
+    PASS1_ARGS=(-n)
+    PASS2_ARGS=(-r3)
+    PASS3_ARGS=(-d -r3)
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+esac
+
+echo
+echo "Recovery directory: $REC_DIR"
+echo "Image will be saved to: $IMG"
+echo "Mapfile will be saved to: $MAP"
+echo "Notes will be saved to:   $NOTES"
+echo "Selected profile:         $PROFILE_NAME"
+echo "Source target:            $SRC_DEV ($SRC_DESC)"
+echo
+
+# Write basic notes (append so resume attempts keep history)
+{
+  echo "-----"
+  echo "ddimg run: $(date -Is)"
+  echo "PROFILE: $PROFILE_NAME"
+  echo "SOURCE TARGET: $SRC_DEV ($SRC_DESC)"
+  echo "DEST PARTITION: $DST_PART"
+  echo "MOUNTPOINT: $MNT"
+  echo "RECOVERY DIR: $REC_DIR"
+  echo
+  echo "findmnt (mountpoint):"
+  findmnt --target "$MNT" 2>/dev/null || true
+  echo
+  echo "Planned commands:"
+  echo "  PASS 1: ddrescue ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+  echo "  PASS 2: ddrescue ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+  if [[ ${#PASS3_ARGS[@]} -gt 0 ]]; then
+    echo "  PASS 3: ddrescue ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+  fi
+} >>"$NOTES" 2>/dev/null || true
+
+# -----------------------------
+# ddrescue passes
+# -----------------------------
+echo "=== PASS 1 ==="
+echo "Running: sudo ddrescue ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+sudo ddrescue "${PASS1_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+
+echo
+read -rp "PASS 1 complete. Run PASS 2? (default: ${RUN_PASS2_DEFAULT_PROMPT^^}) [yes/NO]: " CONT
+CONT="${CONT:-$RUN_PASS2_DEFAULT_PROMPT}"
+if [[ "${CONT,,}" != "yes" ]]; then
+  echo "Done after PASS 1. Files at:"
+  echo "  $IMG"
+  echo "  $MAP"
+  echo "  $NOTES"
+  exit 0
+fi
+
+echo
+echo "=== PASS 2 ==="
+echo "Running: sudo ddrescue ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+sudo ddrescue "${PASS2_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+
+# PASS 3 only exists in some profiles
+if [[ ${#PASS3_ARGS[@]} -gt 0 ]]; then
+  echo
+  read -rp "PASS 2 complete. Run PASS 3 (direct I/O retries)? (default: ${RUN_PASS3_DEFAULT_PROMPT^^}) [yes/NO]: " CONT3
+  CONT3="${CONT3:-$RUN_PASS3_DEFAULT_PROMPT}"
+  if [[ "${CONT3,,}" == "yes" ]]; then
+    echo
+    echo "=== PASS 3 ==="
+    echo "Running: sudo ddrescue ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+    sudo ddrescue "${PASS3_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+  fi
+fi
+
+echo
+echo "All requested passes complete."
+echo "Recovery directory: $REC_DIR"
+echo "Image:   $IMG"
+echo "Mapfile: $MAP"
+echo "Notes:   $NOTES"
+
+# Optional: unmount
+read -rp "Unmount destination mountpoint $MNT (i.e., unmount $DST_PART)? (yes/NO): " UM2
+if [[ "${UM2,,}" == "yes" ]]; then
+  sudo umount "$MNT" && echo "Unmounted $MNT"
+fi
+
+echo "ddimg finished."

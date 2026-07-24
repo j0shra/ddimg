@@ -19,6 +19,7 @@ set -euo pipefail
 #     2) Dying-Triage
 #     3) Aggressive
 #     4) SeverelyFailing-HangProne (skip slow zones + timeout escape)
+#     5) DeadHead-Auto (ddrescue 1.30+; auto skip sizing + new sweeping phase)
 # - Creates recovery dir, writes image + mapfile + notes
 
 require_cmds=(lsblk mount umount ddrescue mountpoint findmnt date find sort awk sed df blockdev)
@@ -369,7 +370,15 @@ echo "       PASS 1: ddrescue -n --min-read-rate=64KiB --skip-size=1MiB,64MiB --
 echo "       PASS 2: ddrescue -n -R --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8"
 echo "       (Stops by default)"
 echo
-read -rp "Choose profile [1/2/3/4] (default: 1): " PROFILE
+echo "  5) Dead head / auto (needs ddrescue 1.30+; leans on the new sweeping phase):"
+echo "       PASS 1: ddrescue -n --min-read-rate=0 --timeout=5m"
+echo "       PASS 2: ddrescue -n -R --min-read-rate=0 --timeout=5m"
+echo "       PASS 3: optional ddrescue -d -r1 --timeout=10m"
+echo "       Skip size is left at the 1.30 default (infile_size/32768, max 1% of disk),"
+echo "       which scales with drive size instead of the fixed values in profile 4."
+echo "       --min-read-rate=0 means auto: recalculated each second as avg_rate/10."
+echo
+read -rp "Choose profile [1/2/3/4/5] (default: 1): " PROFILE
 PROFILE="${PROFILE:-1}"
 
 PROFILE_NAME="Normal"
@@ -409,6 +418,28 @@ case "$PROFILE" in
     PASS1_ARGS=(-n --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
     PASS2_ARGS=(-n -R --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
     PASS3_ARGS=()
+    RUN_PASS2_DEFAULT_PROMPT="yes"
+    RUN_PASS3_DEFAULT_PROMPT="no"
+    ;;
+  5)
+    # Relies on ddrescue 1.30's reordered algorithm: copying skips bad areas fast,
+    # trimming works inward from known-good edges, then sweeping reads the skipped
+    # holes. Leaving --skip-size unset lets 1.30 scale it to the drive.
+    # -n is --no-scrape (sector-by-sector scraping is a waste on a dead head);
+    # it does NOT disable sweeping. --no-sweep would be -N, which we do not use.
+    # Check the binary sudo will actually invoke, not the one on the user's PATH.
+    # sudo has already been used above (mkdir -p "$MNT"), so this adds no new prompt.
+    if ! sudo ddrescue --help 2>/dev/null | grep -q -- '--no-sweep'; then
+      echo "ERROR: Profile 5 requires ddrescue 1.30 or newer (sweeping phase)."
+      echo "sudo resolves ddrescue to: $(sudo command -v ddrescue 2>/dev/null || echo unknown)"
+      echo "Detected version: $(sudo ddrescue --version 2>/dev/null | head -n 1)"
+      echo "Choose another profile, or install ddrescue 1.30+."
+      exit 1
+    fi
+    PROFILE_NAME="DeadHead-Auto"
+    PASS1_ARGS=(-n --min-read-rate=0 --timeout=5m)
+    PASS2_ARGS=(-n -R --min-read-rate=0 --timeout=5m)
+    PASS3_ARGS=(-d -r1 --timeout=10m)
     RUN_PASS2_DEFAULT_PROMPT="yes"
     RUN_PASS3_DEFAULT_PROMPT="no"
     ;;

@@ -187,4 +187,4 @@ All output lands in a recovery folder on the destination partition (`/mnt/backup
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

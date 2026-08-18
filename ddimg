@@ -28,6 +28,92 @@ for c in "${require_cmds[@]}"; do
   command -v "$c" >/dev/null 2>&1 || { echo "Missing required command: $c"; exit 1; }
 done
 
+# =========================================================================
+# DESTINATION PROTECTION
+# Never write recovery output to the OS / internal system disk. Protected =
+#   (a) any disk backing a system mount (/, /boot, /home, swap, ...)
+#   (b) any serial listed in a protected-serials deny file (optional):
+#         /etc/ddimg/internal-serials   or   ~/.config/ddimg/internal-serials
+# The destination must be an explicitly-attached EXTERNAL recovery drive.
+# Checks run against where the file will ACTUALLY land (the backing device of
+# the target path), so a silently-failed mount cannot sneak a write onto the OS
+# disk. To force an override in a genuine edge case: DDIMG_ALLOW_INTERNAL=1.
+# =========================================================================
+PROTECT_FILES=("/etc/ddimg/internal-serials" "${XDG_CONFIG_HOME:-$HOME/.config}/ddimg/internal-serials")
+
+_base_disks() {  # clean base physical disk name(s) backing a device path; one per line
+  local src="${1:-}"; src="${src%%[*}"
+  [[ -n "$src" ]] || return 0
+  # -s walks from the device up to its parent disk(s). Keep only TYPE=disk rows
+  # and strip lsblk's tree glyphs (└─, ├─) off the NAME column. Handles
+  # partitions, LVM/LUKS/mdraid stacks, and multi-disk (RAID) roots.
+  lsblk -nso NAME,TYPE "$src" 2>/dev/null | awk '$2=="disk"{print $1}' | sed 's/^[^[:alnum:]]*//'
+}
+_disk_serial() { lsblk -ndo SERIAL "/dev/$1" 2>/dev/null | tr -d '[:space:]'; }
+
+# Build the protected-disk set once (kernel disk names). Command substitution
+# flattens the (possibly multi-line) disk lists into space-separated words.
+PROTECTED_DISKS=""
+for _m in / /boot /boot/efi /boot/firmware /home /usr /var /etc; do
+  _s="$(findmnt -no SOURCE --target "$_m" 2>/dev/null || true)"
+  [[ -n "${_s:-}" ]] && PROTECTED_DISKS+=" $(_base_disks "$_s" || true)"
+done
+while read -r _sw _; do
+  [[ "${_sw:-}" == /dev/* ]] && PROTECTED_DISKS+=" $(_base_disks "$_sw" || true)"
+done < <(tail -n +2 /proc/swaps 2>/dev/null || true)
+
+# Optional serial deny-list.
+PROTECTED_SERIALS=""
+for _f in "${PROTECT_FILES[@]}"; do
+  [[ -r "$_f" ]] || continue
+  while read -r _line; do
+    _line="${_line%%#*}"; _line="$(printf '%s' "$_line" | tr -d '[:space:]')"
+    [[ -n "$_line" ]] && PROTECTED_SERIALS+=" $_line"
+  done < "$_f"
+done
+
+_is_protected_disk() {  # arg: kernel disk name
+  local disk="$1" ser d s
+  for d in $PROTECTED_DISKS; do [[ "$d" == "$disk" ]] && return 0; done
+  ser="$(_disk_serial "$disk")"
+  if [[ -n "$ser" ]]; then
+    for s in $PROTECTED_SERIALS; do [[ "$s" == "$ser" ]] && return 0; done
+  fi
+  return 1
+}
+
+assert_external_dest() {  # arg: a path OR a block device; exits if on a protected disk
+  local ref="$1" src disks d
+  if [[ -b "$ref" ]]; then
+    src="$ref"
+  else
+    src="$(findmnt -no SOURCE --target "$ref" 2>/dev/null || true)"
+  fi
+  disks="$(_base_disks "$src" || true)"
+  if [[ -z "${disks// }" ]]; then
+    echo "ERROR: cannot determine the backing disk for destination: $ref"
+    echo "Refusing to write until the destination disk is identifiable."
+    exit 1
+  fi
+  while read -r d; do
+    [[ -n "$d" ]] || continue
+    _is_protected_disk "$d" || continue
+    if [[ "${DDIMG_ALLOW_INTERNAL:-0}" == "1" ]]; then
+      echo "WARNING: $ref is on protected internal disk /dev/$d — proceeding because DDIMG_ALLOW_INTERNAL=1."
+      continue
+    fi
+    echo
+    echo "=========================================================================="
+    echo "REFUSING TO WRITE: destination is on /dev/$d, a protected INTERNAL/OS disk."
+    echo "  target: $ref"
+    echo "ddimg never writes recovery data to the OS or any internal system disk."
+    echo "Attach an EXTERNAL recovery drive and select it as the destination."
+    echo "(Deny-list more internal disks by serial in: ${PROTECT_FILES[*]})"
+    echo "=========================================================================="
+    exit 1
+  done <<< "$disks"
+}
+
 echo "=== ddimg: ddrescue imaging helper ==="
 echo "Drives detected:"
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
@@ -54,6 +140,10 @@ if [[ "$SRC_DISK" == "/dev/sd${DST_LET}" ]]; then
   echo "ERROR: Source and destination must be different drives."
   exit 1
 fi
+
+# Safety check: destination must NOT be the OS / internal system disk.
+# (Early friendly check; a final hard check on the real target path runs below.)
+assert_external_dest "$DST_PART"
 
 # -----------------------------
 # NEW: Choose source target (disk vs partition)
@@ -525,6 +615,14 @@ echo
     echo "  PASS 3: ddrescue ${COMMON_ARGS[*]} ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
   fi
 } >>"$NOTES" 2>/dev/null || true
+
+# -----------------------------
+# FINAL destination safety check — verify where the image will ACTUALLY land.
+# This resolves the real backing device of REC_DIR, so a failed/using-wrong
+# mount (e.g. writing into /mnt/... while nothing is mounted → the OS disk)
+# is caught before a single byte is written.
+# -----------------------------
+assert_external_dest "$REC_DIR"
 
 # -----------------------------
 # ddrescue passes

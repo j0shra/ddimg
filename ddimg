@@ -23,6 +23,7 @@ set -euo pipefail
 # - Creates recovery dir, writes image + mapfile + notes
 
 require_cmds=(lsblk mount umount ddrescue mountpoint findmnt date find sort awk sed df blockdev)
+# numfmt (coreutils) is used for the space check; if absent we fall back to raw bytes.
 for c in "${require_cmds[@]}"; do
   command -v "$c" >/dev/null 2>&1 || { echo "Missing required command: $c"; exit 1; }
 done
@@ -169,6 +170,32 @@ else
     exit 1
   fi
   echo "Destination already mounted correctly: $DST_PART at $MNT"
+fi
+
+# -----------------------------
+# Destination free-space check vs source target size (best-effort)
+# A full raw image needs as many bytes as the source target. If the destination
+# has less free space, a whole-disk image cannot complete. Warn loudly.
+# -----------------------------
+fmt_bytes() { numfmt --to=iec "$1" 2>/dev/null || echo "${1} bytes"; }
+SRC_BYTES="$(blockdev --getsize64 "$SRC_DEV" 2>/dev/null || echo 0)"
+DST_AVAIL="$(df -B1 --output=avail "$MNT" 2>/dev/null | tail -n1 | tr -dc '0-9')"
+if [[ "${SRC_BYTES:-0}" -gt 0 && -n "${DST_AVAIL:-}" ]]; then
+  echo
+  echo "Space check:"
+  echo "  Source target size:   $(fmt_bytes "$SRC_BYTES")"
+  echo "  Destination free:     $(fmt_bytes "$DST_AVAIL")"
+  if (( SRC_BYTES > DST_AVAIL )); then
+    echo "  WARNING: source is LARGER than destination free space —"
+    echo "           a full raw image will NOT fit. Options:"
+    echo "             * image a single PARTITION instead of the whole disk,"
+    echo "             * use a larger destination drive, or"
+    echo "             * for a formatted/empty source, carve files (photorec) instead of imaging."
+    read -rp "  Continue anyway? (yes/NO): " SPACE_OK
+    [[ "${SPACE_OK,,}" == "yes" ]] || { echo "Aborted: insufficient destination space."; exit 1; }
+  else
+    echo "  OK: destination has room for a full image."
+  fi
 fi
 
 # Helper: resolve a user-entered path. If absolute, use as-is. If relative, treat as under $MNT.
@@ -350,14 +377,15 @@ fi
 # -----------------------------
 echo
 echo "Imaging profiles:"
+echo "  (all profiles use -c 2048 = 1 MiB reads for speed; dying/failing add -O = reopen-on-error)"
 echo "  1) Normal (balanced):"
 echo "       PASS 1: ddrescue -n"
 echo "       PASS 2: ddrescue -r3"
 echo "       PASS 3: optional ddrescue -d -r3"
 echo
 echo "  2) Dying disk / TRIAGE (avoid week-long retries):"
-echo "       PASS 1: ddrescue -n -b 1M"
-echo "       PASS 2: ddrescue -n -R -b 1M"
+echo "       PASS 1: ddrescue -n -O"
+echo "       PASS 2: ddrescue -n -R -O"
 echo "       (Stops by default)"
 echo
 echo "  3) Aggressive (more retries; only if drive is stable):"
@@ -399,8 +427,12 @@ case "$PROFILE" in
     ;;
   2)
     PROFILE_NAME="Dying-Triage"
-    PASS1_ARGS=(-n -b 1M)
-    PASS2_ARGS=(-n -R -b 1M)
+    # NOTE: prior versions used "-b 1M" here — that sets ddrescue's SECTOR size
+    # to 1 MiB (wrong; -b is the hardware sector size, 512/4096). Large READ size
+    # comes from -c 2048 (see COMMON_ARGS below). -O reopens the device on error,
+    # which helps flaky USB bridges recover instead of aborting the run.
+    PASS1_ARGS=(-n -O)
+    PASS2_ARGS=(-n -R -O)
     PASS3_ARGS=()
     RUN_PASS2_DEFAULT_PROMPT="yes"
     RUN_PASS3_DEFAULT_PROMPT="no"
@@ -415,8 +447,8 @@ case "$PROFILE" in
     ;;
   4)
     PROFILE_NAME="SeverelyFailing-HangProne"
-    PASS1_ARGS=(-n --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
-    PASS2_ARGS=(-n -R --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
+    PASS1_ARGS=(-n -O --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
+    PASS2_ARGS=(-n -R -O --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8)
     PASS3_ARGS=()
     RUN_PASS2_DEFAULT_PROMPT="yes"
     RUN_PASS3_DEFAULT_PROMPT="no"
@@ -437,9 +469,9 @@ case "$PROFILE" in
       exit 1
     fi
     PROFILE_NAME="DeadHead-Auto"
-    PASS1_ARGS=(-n --min-read-rate=0 --timeout=5m)
-    PASS2_ARGS=(-n -R --min-read-rate=0 --timeout=5m)
-    PASS3_ARGS=(-d -r1 --timeout=10m)
+    PASS1_ARGS=(-n -O --min-read-rate=0 --timeout=5m)
+    PASS2_ARGS=(-n -R -O --min-read-rate=0 --timeout=5m)
+    PASS3_ARGS=(-d -O -r1 --timeout=10m)
     RUN_PASS2_DEFAULT_PROMPT="yes"
     RUN_PASS3_DEFAULT_PROMPT="no"
     ;;
@@ -453,6 +485,16 @@ case "$PROFILE" in
     RUN_PASS3_DEFAULT_PROMPT="no"
     ;;
 esac
+
+# -----------------------------
+# COMMON args applied to EVERY pass, all profiles.
+#   -c 2048 = 1 MiB reads. THE most important throughput flag: ddrescue's
+#   default 64 KiB reads cap around ~6 MB/s because each read is a synchronous
+#   round-trip; 1 MiB reads reach ~100 MB/s on healthy zones (~15x faster).
+#   ddrescue still refines bad clusters at hardware-sector granularity during
+#   trimming/scraping, so a large read size does not reduce what is recovered.
+# -----------------------------
+COMMON_ARGS=(-c 2048)
 
 echo
 echo "Recovery directory: $REC_DIR"
@@ -477,10 +519,10 @@ echo
   findmnt --target "$MNT" 2>/dev/null || true
   echo
   echo "Planned commands:"
-  echo "  PASS 1: ddrescue ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
-  echo "  PASS 2: ddrescue ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+  echo "  PASS 1: ddrescue ${COMMON_ARGS[*]} ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+  echo "  PASS 2: ddrescue ${COMMON_ARGS[*]} ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
   if [[ ${#PASS3_ARGS[@]} -gt 0 ]]; then
-    echo "  PASS 3: ddrescue ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+    echo "  PASS 3: ddrescue ${COMMON_ARGS[*]} ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
   fi
 } >>"$NOTES" 2>/dev/null || true
 
@@ -488,8 +530,8 @@ echo
 # ddrescue passes
 # -----------------------------
 echo "=== PASS 1 ==="
-echo "Running: sudo ddrescue ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
-sudo ddrescue "${PASS1_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+echo "Running: sudo ddrescue ${COMMON_ARGS[*]} ${PASS1_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+sudo ddrescue "${COMMON_ARGS[@]}" "${PASS1_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
 
 echo
 read -rp "PASS 1 complete. Run PASS 2? (default: ${RUN_PASS2_DEFAULT_PROMPT^^}) [yes/NO]: " CONT
@@ -504,8 +546,8 @@ fi
 
 echo
 echo "=== PASS 2 ==="
-echo "Running: sudo ddrescue ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
-sudo ddrescue "${PASS2_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+echo "Running: sudo ddrescue ${COMMON_ARGS[*]} ${PASS2_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+sudo ddrescue "${COMMON_ARGS[@]}" "${PASS2_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
 
 # PASS 3 only exists in some profiles
 if [[ ${#PASS3_ARGS[@]} -gt 0 ]]; then
@@ -515,8 +557,8 @@ if [[ ${#PASS3_ARGS[@]} -gt 0 ]]; then
   if [[ "${CONT3,,}" == "yes" ]]; then
     echo
     echo "=== PASS 3 ==="
-    echo "Running: sudo ddrescue ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
-    sudo ddrescue "${PASS3_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
+    echo "Running: sudo ddrescue ${COMMON_ARGS[*]} ${PASS3_ARGS[*]} \"$SRC_DEV\" \"$IMG\" \"$MAP\""
+    sudo ddrescue "${COMMON_ARGS[@]}" "${PASS3_ARGS[@]}" "$SRC_DEV" "$IMG" "$MAP"
   fi
 fi
 

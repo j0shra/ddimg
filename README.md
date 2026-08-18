@@ -20,15 +20,32 @@ An interactive Bash wrapper around `ddrescue` that guides you through imaging a 
    - Custom name (auto-increments if it already exists)
    - Resume/re-attempt an existing folder — scans for folders containing a prior `image.img` or `recovery.map`, or lets you type a path manually. No auto-increment; reuses whatever is already there.
 
-5. **Imaging profile** — Five ddrescue strategies:
+5. **Imaging profile** — Five ddrescue strategies. **Every profile applies `-c 2048` (1 MiB reads)** — see note below — and the dying/failing profiles add `-O` (reopen-on-error) so a flaky USB bridge recovers instead of aborting the run:
 
    | # | Profile | Description |
    |---|---------|-------------|
    | 1 | **Normal** | Pass 1: `-n` (no scrape). Pass 2: `-r3` (3 retries). Optional Pass 3: `-d -r3` (direct I/O). Balanced default. |
-   | 2 | **Dying-Triage** | Pass 1: `-n -b 1M`. Pass 2: `-n -R -b 1M` (reverse). Large block size, forward then reverse pass. Avoids prolonged retries on a rapidly dying disk. |
+   | 2 | **Dying-Triage** | Pass 1: `-n -O`. Pass 2: `-n -R -O` (reverse). Forward then reverse pass; reopens on error. Avoids prolonged retries on a rapidly dying disk. |
    | 3 | **Aggressive** | Pass 1: `-n`. Pass 2: `-r7`. Pass 3: `-d -r7`. More retries for a drive that is degraded but stable. |
-   | 4 | **SeverelyFailing-HangProne** | Pass 1 & 2 both use `--min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8`. Skips and times out on slow zones to avoid indefinite hangs on a drive that stalls. |
-   | 5 | **DeadHead-Auto** | Pass 1: `-n --min-read-rate=0 --timeout=5m`. Pass 2: same, reversed (`-R`). Optional Pass 3: `-d -r1 --timeout=10m`. Requires **ddrescue 1.30+**. See below. |
+   | 4 | **SeverelyFailing-HangProne** | Pass 1 & 2 both use `-O --min-read-rate=64KiB --skip-size=1MiB,64MiB --timeout=8`. Skips and times out on slow zones to avoid indefinite hangs on a drive that stalls. |
+   | 5 | **DeadHead-Auto** | Pass 1: `-n -O --min-read-rate=0 --timeout=5m`. Pass 2: same, reversed (`-R`). Optional Pass 3: `-d -O -r1 --timeout=10m`. Requires **ddrescue 1.30+**. See below. |
+
+   ### `-c 2048` — the throughput flag every profile now uses
+
+   ddrescue's default read size is 64 KiB (`-c 128`). On any drive with per-command
+   latency (USB bridges, high-latency SATA, network) that caps throughput near
+   **~6 MB/s**, because each read is a synchronous round-trip. `-c 2048` (1 MiB
+   reads) reaches **~100 MB/s on healthy zones — roughly 15× faster** — and on a
+   dying drive that is the difference between a feasible image and one that would
+   take days. It does not reduce what is recovered: ddrescue still refines bad
+   clusters at hardware-sector granularity during trimming and scraping.
+
+   ### Destination space check
+
+   After mounting the destination, ddimg compares the **source target size** to the
+   **destination free space** and warns before starting if a full raw image will not
+   fit (e.g. a 1 TB source onto a 931 GB backup). For a formatted/empty source, prefer
+   carving files over imaging the whole device, or image a single partition.
 
 ### Profile 5 — DeadHead-Auto
 
